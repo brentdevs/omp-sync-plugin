@@ -250,7 +250,7 @@ export class Controller {
           this.requireEnrollment(connection);
           if (!brokerMatches(this.settings, connection)) throw new UserError("Broker configuration changed during consent; review it again");
           const success = await migrateCredentials(connection, oauth, environment, this.abort.signal);
-          this.notify(ctx, success ? "Credential migration completed; broker snapshots propagate available credentials." : "Migration did not fully complete; inspect omp auth-broker migrate --from-local --dry-run. Credential output was not displayed.", success ? "info" : "error");
+          this.notify(ctx, success ? "Credential migration completed; broker snapshots propagate available credentials." : "Migration did not fully complete; run auth-broker migrate --from-local --dry-run through your OMP launcher (including nix run). Credential output was not displayed.", success ? "info" : "error");
         }, true); });
         await this.run();
       } else this.notify(ctx, `Usage: /sync ${COMMANDS.join(" | ")}`, "warning");

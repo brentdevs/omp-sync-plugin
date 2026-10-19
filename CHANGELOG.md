@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.1
+
+- Credential migration reuses the active OMP/Bun runtime instead of requiring `omp` on `PATH`, including compiled binaries started with `nix run`.
+- Actionable, non-secret subprocess failure/cancellation guidance and a real migration regression with an empty `PATH`.
+- npm/source migration binds to the running host entrypoint, never a plugin-local peer CLI; active-child cancellation is reported even when `child.exited` resolves to a nonzero status instead of throwing.
+- Exact 64 MiB snapshot acceptance and one-byte overflow rejection preserve the readable file byte-for-byte without pinning diagnostic wording.
+
 ## 0.1.0
 
 - OMP extension enrollment with single-use server pairing codes and local device-token storage.

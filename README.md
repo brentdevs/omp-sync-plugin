@@ -62,7 +62,7 @@ Pairing does **not** silently upload your old local API keys or OAuth refresh to
 /sync migrate
 ```
 
-The plugin confirms API-key migration and separately asks whether to include OAuth accounts and environment API keys. It invokes OMP's existing `auth-broker migrate --from-local` command, which preserves existing broker accounts. The `omp` executable must be on `PATH`. Migration is not repeated in the background and does not delete local credential copies.
+The plugin confirms API-key migration and separately asks whether to include OAuth accounts and environment API keys. It invokes OMP's existing `auth-broker migrate --from-local` command, which preserves existing broker accounts. Migration reuses the running OMP executable for compiled/Nix installations, or the current Bun executable and the running host's `Bun.main` CLI entrypoint for npm/source installations. It never resolves a CLI from the plugin's own peer dependencies. A separate `omp` executable on `PATH` is not required, including when starting OMP with `nix run`. Migration is not repeated in the background and does not delete local credential copies.
 
 Enrollment changes are locked throughout migration consent/execution. The child command is pinned to the consented server/device bearer in its environment, not token-bearing command-line arguments; a concurrent config edit cannot redirect the upload.
 
@@ -74,6 +74,16 @@ omp auth-broker migrate --from-local
 # Additional explicit opt-ins:
 omp auth-broker migrate --from-local --include-oauth --include-env
 ```
+
+For a Nix-launched installation, pass application arguments after `--`:
+
+```sh
+nix --extra-experimental-features 'nix-command flakes' run github:yuxqiu/omp-nix -- \
+  auth-broker migrate --from-local --include-oauth --dry-run
+# Remove --dry-run only after reviewing the planned accounts.
+```
+
+If the migration subprocess cannot execute, the plugin reports general execution guidance without displaying subprocess output or credentials. Authored safe errors retain their guidance. Cancellation is checked after child exit as well as before launch: it reports cancellation rather than a generic nonzero exit, but some credentials may already have reached the broker. Local copies remain. A nonzero migration exit still requires inspection with the direct dry-run command through your usual OMP launcher.
 
 After migrating OAuth, do not continue independently refreshing copied refresh tokens. Perform subsequent logins on the broker host using `omp auth-broker login` (see the server's login/SSH instructions). Broker snapshots then propagate new usable credentials automatically. Config/environment/runtime key overrides retain normal OMP precedence; connecting does not silently remove them.
 
