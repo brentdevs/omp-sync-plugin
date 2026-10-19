@@ -1,5 +1,7 @@
 import type { Changes, Connection, Json, MutationRequest, MutationResult, Snapshot, SyncRecord, Transport } from "./types";
 import { equal } from "./types";
+import { UserError } from "./errors";
+import { isDeviceToken, requireDeviceToken } from "./token";
 
 const MAX_RESPONSE = 16 * 1024 * 1024;
 const MAX_REQUEST = 1024 * 1024;
@@ -20,14 +22,13 @@ function integer(value: unknown): number {
   return value;
 }
 function json(value: unknown, depth = 0): Json {
-  if (depth > 64) return invalid();
+  if (depth > 128) return invalid();
   if (value === null || typeof value === "boolean" || typeof value === "string") return value;
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (Array.isArray(value)) return value.map(item => json(item, depth + 1));
   const source = object(value);
   const result: Record<string, Json> = Object.create(null);
   for (const key of Object.keys(source)) {
-    if (key === "__proto__" || key === "constructor" || key === "prototype") return invalid();
     result[key] = json(source[key], depth + 1);
   }
   return result;
@@ -57,14 +58,15 @@ export function normalizeServerUrl(input: string): string {
     const loopback = url.hostname === "localhost" || url.hostname === "[::1]" || /^127\.(?:\d{1,3}\.){2}\d{1,3}$/.test(url.hostname);
     if ((url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) || url.username || url.password || url.search || url.hash || url.pathname !== "/" || input.includes("?") || input.includes("#")) throw new Error();
     return url.origin;
-  } catch { throw new Error("Sync server must be an HTTPS origin (HTTP is allowed only on loopback)"); }
+  } catch { throw new UserError("Sync server must be an HTTPS origin (HTTP is allowed only on loopback)"); }
 }
-const errorCodes = new Set(["unauthorized", "invalid_pairing", "pairing_rate_limit", "conflict", "resync_required", "invalid_cursor", "invalid_request", "operation_id_reused", "operation_conflict", "body_too_large", "not_found", "internal_error", "connection_limit", "forbidden", "revoked"]);
+const errorCodes: Record<string, true> = { unauthorized: true, invalid_pairing: true, pairing_rate_limit: true, conflict: true, resync_required: true, invalid_cursor: true, invalid_request: true, operation_reused: true, body_too_large: true, body_unreadable: true, invalid_json: true, unsupported_media_type: true, browser_access_denied: true, method_not_allowed: true, broker_unavailable: true, device_not_found: true, not_found: true, internal_error: true, request_error: true, connection_limit: true };
 async function request(url: string, token: string | undefined, path: string, body: unknown, signal: AbortSignal | undefined, fetcher: typeof fetch): Promise<unknown> {
   let encoded: string | undefined;
   if (body !== undefined) {
     try { encoded = JSON.stringify(body); } catch { throw new ApiError(0, "invalid_request"); }
-    if (encoded === undefined || new TextEncoder().encode(encoded).byteLength > MAX_REQUEST) throw new ApiError(413, "body_too_large");
+    if (encoded === undefined) throw new ApiError(0, "invalid_request");
+    if (new TextEncoder().encode(encoded).byteLength > MAX_REQUEST) throw new ApiError(413, "body_too_large");
   }
   const controller = new AbortController();
   const abort = () => controller.abort();
@@ -103,11 +105,11 @@ async function request(url: string, token: string | undefined, path: string, bod
       let code = "http_error";
       if (value && typeof value === "object" && "error" in value) {
         const error = value.error;
-        if (error && typeof error === "object" && "code" in error && typeof error.code === "string" && errorCodes.has(error.code)) code = error.code;
+        if (error && typeof error === "object" && "code" in error && typeof error.code === "string" && Object.hasOwn(errorCodes, error.code)) code = error.code;
       }
       throw new ApiError(response.status, code);
     }
-    if (!response.headers.get("content-type")?.toLowerCase().startsWith("application/json")) return invalid();
+    if (!/^application\/json(?:\s*;|$)/i.test(response.headers.get("content-type") ?? "")) return invalid();
     return value;
   } catch (error) {
     if (error instanceof ApiError) throw error;
@@ -120,17 +122,18 @@ async function request(url: string, token: string | undefined, path: string, bod
   }
 }
 export async function pairDevice(url: string, code: string, signal?: AbortSignal): Promise<Pick<Connection, "device" | "token">> {
-  const input = object(await request(normalizeServerUrl(url), undefined, "/sync/v1/pair", { code: text(code) }, signal, fetch));
+  if (typeof code !== "string" || !code.trim() || code.length > 128 || !code.isWellFormed() || /[\u0000-\u001f\u007f]/.test(code)) throw new UserError("Enter a nonempty pairing code from the sync server (at most 128 characters, without control characters).");
+  const input = object(await request(normalizeServerUrl(url), undefined, "/sync/v1/pair", { code }, signal, fetch));
   const device = object(input.device);
   const token = text(input.token, 256);
-  if (!/^[\x21-\x7e]+$/.test(token)) return invalid();
+  if (!isDeviceToken(token)) return invalid();
   return { token, device: { id: text(device.id), name: text(device.name), profile: text(device.profile) } };
 }
 export class SyncClient implements Transport {
   private readonly url: string;
   constructor(url: string, private readonly token: string, private readonly fetcher: typeof fetch = fetch) {
     this.url = normalizeServerUrl(url);
-    if (!token || token.length > 256 || !/^[\x21-\x7e]+$/.test(token)) throw new ApiError(0, "invalid_token");
+    requireDeviceToken(token);
   }
   async snapshot(signal?: AbortSignal): Promise<Snapshot> {
     const input = object(await request(this.url, this.token, "/sync/v1/snapshot", undefined, signal, this.fetcher));

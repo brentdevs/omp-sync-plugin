@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { closeSync, ftruncateSync, mkdtempSync, openSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,7 +9,7 @@ import { emptyState, identity, type Connection } from "../src/types";
 const directories: string[] = [];
 function temporary(): string { const dir = mkdtempSync(join(tmpdir(), "omp-sync-storage-")); directories.push(dir); return dir; }
 afterEach(() => { for (const dir of directories.splice(0)) rmSync(dir, { recursive: true, force: true }); });
-const connection: Connection = { version: 1, url: "https://sync.example.com", token: "private-token", device: { id: "device", name: "Laptop", profile: "default" }, previousBroker: { url: "https://previous.example.com", token: "previous-token" } };
+const connection: Connection = { version: 1, url: "https://sync.example.com", token: `omps_${"a".repeat(43)}`, device: { id: "device", name: "Laptop", profile: "default" }, previousBroker: { url: "https://previous.example.com", token: "previous-token" } };
 
 describe("DiskStore durable boundary", () => {
   test("persists isolated snapshots across restart with private permissions", () => {
@@ -86,4 +86,64 @@ describe("DiskStore durable boundary", () => {
       const recovered = new DiskStore(dir, "device").lock(); expect(recovered).toBeDefined(); recovered?.();
     } finally { child.kill(); await child.exited; }
   }, 10_000);
+  test("persists inert reserved keys in remote values and sanitized diagnostics", () => {
+    const store = new DiskStore(temporary(), "device");
+    const state = emptyState("device");
+    const raw = JSON.parse('{"__proto__":{"polluted":true},"constructor":{},"prototype":1}');
+    state.remote[identity("setting", "theme")] = { kind: "setting", key: "theme", revision: 1, deleted: false, value: raw, deviceId: "other", updatedAt: 1 };
+    state.issues = [{ kind: "setting", key: "theme", reason: "invalid", message: "Invalid remote value", local: { deleted: false, value: "[invalid sync value]" }, remote: { deleted: false, value: raw } }];
+    store.save(state);
+    expect(store.load()).toEqual(state);
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  });
+  test("oversized save and decision preserve the previous readable snapshot", () => {
+    const store = new DiskStore(temporary(), "device");
+    const before = emptyState("device"); store.save(before);
+    const oversized = emptyState("device");
+    const huge = { deleted: false as const, value: "x".repeat(64 * 1024 * 1024) };
+    oversized.base[identity("setting", "large")] = huge;
+    expect(() => store.save(oversized)).toThrow("64 MiB");
+    expect(store.load()).toEqual(before);
+    const decision = emptyState("device");
+    decision.decisions[identity("setting", "large")] = { side: "local", local: huge, remote: { deleted: true } };
+    expect(() => store.save(decision)).toThrow("64 MiB");
+    expect(store.load()).toEqual(before);
+  });
+  test("rejects oversized sparse corrupt files before parsing and leaves them intact", () => {
+    const dir = temporary(); const path = join(dir, "state.json");
+    const fd = openSync(path, "w", 0o600);
+    try { ftruncateSync(fd, 64 * 1024 * 1024 + 1); } finally { closeSync(fd); }
+    expect(() => new DiskStore(dir, "device").load()).toThrow();
+    expect(statSync(path).size).toBe(64 * 1024 * 1024 + 1);
+  });
+  test("rejects malformed persisted device tokens on save and load", () => {
+    const dir = temporary();
+    for (const token of ["plain", `omps_${"a".repeat(42)}`, `omps_${"!".repeat(43)}`]) {
+      expect(() => saveConnection(dir, { ...connection, token })).toThrow();
+      writeFileSync(join(dir, "connection.json"), JSON.stringify({ ...connection, token }));
+      expect(() => loadConnection(dir)).toThrow();
+    }
+  });
+  test("validates durable rejected-write suppression and syncable base values", () => {
+    const store = new DiskStore(temporary(), "device");
+    const state = emptyState("device");
+    state.rejected = { [identity("setting", "theme")]: { local: { deleted: false, value: "dark" }, code: "invalid_request" } };
+    store.save(state);
+    expect(store.load()).toEqual(state);
+    state.rejected[identity("setting", "theme")]!.code = "upstream secret\n";
+    expect(() => store.save(state)).toThrow();
+    const unsafe = emptyState("device");
+    unsafe.base[identity("setting", "theme")] = { deleted: false, value: JSON.parse('{"__proto__":{}}') };
+    expect(() => store.save(unsafe)).toThrow();
+  });
+  test("preserves enrollment recovery marker and rejects other marker values", () => {
+    const dir = temporary();
+    const pending = { ...connection, enrollmentPending: true as const };
+    saveConnection(dir, pending);
+    expect(loadConnection(dir)).toEqual(pending);
+    for (const enrollmentPending of [false, "true", 1, null]) {
+      writeFileSync(join(dir, "connection.json"), JSON.stringify({ ...connection, enrollmentPending }));
+      expect(() => loadConnection(dir)).toThrow();
+    }
+  });
 });

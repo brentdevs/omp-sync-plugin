@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { UserError } from "./errors";
 import {
   equal, identity, validRecordKey, valueOf,
   type Decision, type Issue, type Kind, type LocalAdapter, type Mutation, type MutationRequest,
@@ -16,6 +17,31 @@ function terminal(error: unknown): boolean {
   const failure = error as { status?: unknown; code?: unknown };
   return failure.status === 409 && (failure.code === "conflict" || failure.code === "resync_required");
 }
+
+function rejection(error: unknown): string | undefined {
+  if (!error || typeof error !== "object") return;
+  const { status, code } = error as { status?: number; code?: string };
+  if (status === 409 && code === "operation_reused") return "operation_reused";
+  if (typeof status === "number" && status >= 400 && status < 500
+    && ![401, 408, 409, 425, 429].includes(status)) return `rejection_http_${status}`;
+}
+
+// Check before cloning, comparison, or persistence: local adapters can expose
+// cyclic/non-JSON objects, and raw remote JSON can contain reserved keys.
+function syncable(value: unknown, depth = 0, ancestors = new Set<object>()): boolean {
+  if (depth > 64) return false;
+  if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value !== "object" || ancestors.has(value)) return false;
+  if (!Array.isArray(value) && Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) return false;
+  ancestors.add(value);
+  const valid = Object.keys(value).every(key => !["__proto__", "constructor", "prototype"].includes(key)
+    && syncable((value as Record<string, unknown>)[key], depth + 1, ancestors));
+  ancestors.delete(value);
+  return valid;
+}
+
+const opaque = (): Value => ({ deleted: false, value: "[invalid sync value]" });
 
 function recordIdentity(id: string): { kind: Kind; key: string } | undefined {
   try {
@@ -69,13 +95,21 @@ export class SyncEngine {
 
   async decide(id: string, side: "local" | "remote", reviewed: Pick<Issue, "local" | "remote">): Promise<void> {
     const release = this.store.lock();
-    if (!release) throw new Error("Another sync operation is running");
+    if (!release) throw new UserError("Another sync operation is running");
     try {
       const state = this.store.load();
       const issue = state.issues.find(item => identity(item.kind, item.key) === id);
-      if (!issue) throw new Error("No unresolved issue exists for that record");
+      if (!issue) throw new UserError("No unresolved issue exists for that record");
+      if (issue.reason === "invalid") throw new UserError("Invalid records cannot be approved");
+      const current = Object.values(await this.local.read()).find(record => identity(record.kind, record.key) === id);
+      if (current && (!syncable(current.value) || this.local.policy(current) === "invalid")) {
+        throw new UserError("Invalid records cannot be approved");
+      }
+      if (!equal(valueOf(current), issue.local)) {
+        throw new UserError("Configuration changed while it was being reviewed; review it again");
+      }
       if (!reviewed || !equal(issue.local, reviewed.local) || !equal(issue.remote, reviewed.remote)) {
-        throw new Error("Configuration changed while it was being reviewed; review it again");
+        throw new UserError("Configuration changed while it was being reviewed; review it again");
       }
       state.decisions[id] = structuredClone({ local: issue.local, remote: issue.remote, side } satisfies Decision);
       this.store.save(state);
@@ -86,19 +120,20 @@ export class SyncEngine {
 
   exclude(kind: Kind, key: string, excluded: boolean): void {
     const release = this.store.lock();
-    if (!release) throw new Error("Another sync operation is running");
+    if (!release) throw new UserError("Another sync operation is running");
     try {
       const state = this.store.load();
       const id = identity(kind, key);
       const exclusions = new Set(state.excluded);
       if (exclusions.has(id) === excluded) return;
       if (state.pending?.mutations.some(item => identity(item.kind, item.key) === id)) {
-        throw new Error("Settle the pending sync operation before changing this exclusion");
+        throw new UserError("Settle the pending sync operation before changing this exclusion");
       }
       if (excluded) exclusions.add(id);
       else exclusions.delete(id);
       state.excluded = [...exclusions];
       delete state.decisions[id];
+      if (state.rejected) delete state.rejected[id];
       state.issues = state.issues.filter(item => identity(item.kind, item.key) !== id);
       this.store.save(state);
     } finally {
@@ -113,16 +148,27 @@ export class SyncEngine {
       signal?.throwIfAborted();
       result = await this.transport.mutate(request, signal);
     } catch (error) {
-      if (!terminal(error)) throw error;
+      signal?.throwIfAborted();
+      if (!terminal(error)) {
+        const code = rejection(error);
+        if (!code) throw error;
+        state.rejected ??= {};
+        for (const item of request.mutations) {
+          const id = identity(item.kind, item.key);
+          state.rejected[id] = { local: valueOf(item), code };
+          delete state.decisions[id];
+        }
+      }
       delete state.pending;
       this.store.save(state);
       return false;
     }
     const acknowledged = new Map(result.records.map(record => [identity(record.kind, record.key), record]));
     // A malformed success is uncertain, too: retain the original operation for retry.
-    if (result.epoch !== request.epoch || request.mutations.some(item => {
+    if (result.epoch !== request.epoch || result.records.length !== request.mutations.length || request.mutations.some(item => {
       const record = acknowledged.get(identity(item.kind, item.key));
-      return !record || record.revision <= item.expectedRevision || !equal(valueOf(record), valueOf(item));
+      return !record || !Number.isSafeInteger(record.revision) || record.revision <= item.expectedRevision
+        || (!record.deleted && !syncable(record.value)) || !equal(valueOf(record), valueOf(item));
     })) throw new Error("The sync server returned an inconsistent mutation acknowledgment");
     for (const item of request.mutations) {
       const id = identity(item.kind, item.key);
@@ -130,6 +176,7 @@ export class SyncEngine {
       state.base[id] = valueOf(record);
       if (state.epoch === result.epoch) this.cache(state, record);
       delete state.decisions[id];
+      if (state.rejected) delete state.rejected[id];
     }
     // The response cursor can include unrelated writes that we have not consumed.
     delete state.pending;
@@ -185,7 +232,7 @@ export class SyncEngine {
     const values = await this.local.read();
     const locals: Record<string, RecordValue> = {};
     for (const record of Object.values(values)) {
-      if (record.kind === "setting" || record.kind === "provider") locals[identity(record.kind, record.key)] = structuredClone(record);
+      if (record.kind === "setting" || record.kind === "provider") locals[identity(record.kind, record.key)] = record;
     }
     const ids = new Set([...Object.keys(state.base), ...Object.keys(state.remote), ...Object.keys(locals)]);
     const excluded = new Set(state.excluded);
@@ -198,20 +245,16 @@ export class SyncEngine {
       const local = valueOf(locals[id]);
       const cached = state.remote[id];
       const remote = valueOf(cached);
-      let decision: Decision | undefined = state.decisions[id];
-      if (decision && (!equal(decision.local, local) || !equal(decision.remote, remote))) {
-        delete state.decisions[id];
-        decision = undefined;
-      }
       const policies = [locals[id], remote.deleted ? undefined : { kind, key, value: remote.value }]
         .filter((record): record is RecordValue => record !== undefined)
-        .map(record => this.local.policy(record));
+        .map(record => syncable(record.value) ? this.local.policy(record) : "invalid");
       if (excluded.has(id) || policies.includes("excluded")) {
         delete state.decisions[id];
         continue;
       }
       const issue = (reason: Issue["reason"], message: string): void => {
-        issues.push({ kind, key, reason, message, local, remote });
+        issues.push({ kind, key, reason, message, local: reason === "invalid" ? opaque() : local,
+          remote: reason === "invalid" ? opaque() : remote });
       };
       if (!validRecordKey(key)) {
         delete state.decisions[id];
@@ -223,8 +266,20 @@ export class SyncEngine {
         issue("invalid", "This record is not valid for the installed OMP configuration");
         continue;
       }
+      let decision: Decision | undefined = state.decisions[id];
+      if (decision && (!equal(decision.local, local) || !equal(decision.remote, remote))) {
+        delete state.decisions[id];
+        decision = undefined;
+      }
+      const rejected = state.rejected?.[id];
+      if (rejected && !equal(rejected.local, local)) delete state.rejected![id];
+      else if (rejected && !decision) {
+        issue("conflict", `The sync server rejected this value (${rejected.code}); review before retrying`);
+        continue;
+      }
       if (equal(local, remote)) {
         state.base[id] = remote;
+        if (state.rejected) delete state.rejected[id];
         delete state.decisions[id];
         continue;
       }
@@ -232,6 +287,12 @@ export class SyncEngine {
         const expectedRevision = cached?.revision ?? 0;
         const mutation: Mutation = local.deleted ? { kind, key, expectedRevision, deleted: true }
           : { kind, key, expectedRevision, deleted: false, value: local.value };
+        const probe: MutationRequest = { epoch: state.epoch!, operationId: "0".repeat(36), mutations: [mutation] };
+        if (Buffer.byteLength(JSON.stringify(probe)) > MAX_BODY_BYTES) {
+          delete state.decisions[id];
+          issue("invalid", "This record exceeds the sync server's one MiB request limit");
+          return;
+        }
         plan.uploads.push({ mutation, local, remote });
       };
       const incoming = (): void => {
@@ -261,9 +322,21 @@ export class SyncEngine {
     for (const apply of plan.applies) {
       signal?.throwIfAborted();
       // The adapter compares against this observation, not a freshly read value.
-      await this.local.apply(apply.kind, apply.key, apply.value, apply.expected);
+      try {
+        await this.local.apply(apply.kind, apply.key, apply.value, apply.expected);
+      } catch (error) {
+        signal?.throwIfAborted();
+        if (!(error instanceof UserError)) throw error;
+        state.issues.push({ kind: apply.kind, key: apply.key, reason: "conflict",
+          message: error.message,
+          local: apply.expected, remote: apply.value });
+        delete state.decisions[identity(apply.kind, apply.key)];
+        this.store.save(state);
+        continue;
+      }
       const id = identity(apply.kind, apply.key);
       state.base[id] = apply.value;
+      if (state.rejected) delete state.rejected[id];
       delete state.decisions[id];
       this.store.save(state);
     }
@@ -276,13 +349,6 @@ export class SyncEngine {
     let bytes = Buffer.byteLength(JSON.stringify(request));
     for (const upload of uploads) {
       const size = Buffer.byteLength(JSON.stringify(upload.mutation));
-      const emptyBytes = Buffer.byteLength(JSON.stringify({ ...request, mutations: [] }));
-      if (emptyBytes + size > MAX_BODY_BYTES) {
-        state.issues.push({ kind: upload.mutation.kind, key: upload.mutation.key, reason: "invalid",
-          message: "This record exceeds the sync server's one MiB request limit", local: upload.local, remote: upload.remote });
-        delete state.decisions[identity(upload.mutation.kind, upload.mutation.key)];
-        continue;
-      }
       if (request.mutations.length === 100 || bytes + size + (request.mutations.length ? 1 : 0) > MAX_BODY_BYTES) {
         batches.push(request);
         request = { epoch: state.epoch!, operationId: randomUUID(), mutations: [] };

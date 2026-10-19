@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { SyncEngine } from "../src/engine";
+import { DiskStore } from "../src/storage";
+import { UserError } from "../src/errors";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   emptyState, equal, identity, valueOf,
   type Changes, type Json, type Kind, type LocalAdapter, type MutationRequest, type MutationResult,
@@ -50,7 +55,7 @@ class MemoryLocal implements LocalAdapter {
     const hook = this.beforeApply;
     this.beforeApply = undefined;
     hook?.();
-    if (!equal(this.value(key, kind), expected)) throw new Error("local changed");
+    if (!equal(this.value(key, kind), expected)) throw new UserError("local changed");
     if (value.deleted) this.delete(key, kind);
     else this.set(key, value.value, kind);
     this.applications++;
@@ -345,7 +350,8 @@ describe("SyncEngine", () => {
     first.local.set("theme", "remote-edit");
     await first.engine.sync();
     second.local.beforeApply = () => second.local.set("theme", "racing-local-edit");
-    await expect(second.engine.sync()).rejects.toThrow("local changed");
+    await second.engine.sync();
+    expect(second.store.state.issues[0]?.reason).toBe("conflict");
     expect(second.store.state.base[id("theme")]).toEqual(present("base"));
     expect(second.store.state.cursor).toBe(server.revision);
     expect(valueOf(second.store.state.remote[id("theme")])).toEqual(present("remote-edit"));
@@ -387,7 +393,7 @@ describe("SyncEngine", () => {
     expect(server.value("user-excluded")).toEqual({ deleted: true });
     expect(first.local.value("user-excluded")).toEqual(present("local-only"));
     expect(first.store.state.issues.map(issue => issue.reason)).toEqual(["invalid"]);
-    await first.engine.decide(id("invalid"), "remote", first.store.load().issues[0]!);
+    await expect(first.engine.decide(id("invalid"), "remote", first.store.load().issues[0]!)).rejects.toThrow("Invalid");
     await first.engine.sync();
     expect(first.local.value("invalid")).toEqual({ deleted: true });
     expect(first.store.state.issues[0]?.reason).toBe("invalid");
@@ -456,5 +462,227 @@ describe("SyncEngine", () => {
     first.transport.offline = true;
     await expect(first.engine.sync()).rejects.toThrow("offline");
     expect(first.store.held).toBe(false);
+  });
+  test("unsafe local diagnostics persist on disk without preventing unrelated uploads", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "omp-engine-"));
+    try {
+      const server = new MemoryServer();
+      const store = new DiskStore(directory, "disk-device");
+      const local = new MemoryLocal();
+      const cyclic: { child?: unknown } = {};
+      cyclic.child = cyclic;
+      let deep: Json = "leaf";
+      for (let n = 0; n < 70; n++) deep = { child: deep };
+      local.set("reserved", JSON.parse('{"__proto__":{"polluted":true}}'));
+      local.set("deep", deep);
+      local.set("cyclic", cyclic as Json);
+      local.set("valid", "uploaded");
+      const engine = new SyncEngine(new MemoryTransport(server, "disk-device"), store, local);
+      await engine.sync();
+      const saved = store.load();
+      expect(saved.issues.map(issue => issue.key).sort()).toEqual(["cyclic", "deep", "reserved"]);
+      for (const issue of saved.issues) {
+        expect(issue.local).toEqual(present("[invalid sync value]"));
+        await expect(engine.decide(id(issue.key), "local", issue)).rejects.toThrow("Invalid");
+      }
+      expect(saved.pending).toBeUndefined();
+      expect(server.value("valid")).toEqual(present("uploaded"));
+      await engine.sync();
+      expect(store.load().issues).toHaveLength(3);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  test("reserved remote JSON stays inert in the disk cache while good records apply", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "omp-engine-"));
+    try {
+      const server = new MemoryServer();
+      server.put("bad", present(JSON.parse('{"constructor":{"prototype":{"polluted":true}}}')));
+      server.put("good", present("remote"));
+      const store = new DiskStore(directory, "disk-device");
+      const local = new MemoryLocal();
+      const engine = new SyncEngine(new MemoryTransport(server, "disk-device"), store, local);
+      await engine.sync();
+      await engine.sync();
+      expect(local.value("bad")).toEqual({ deleted: true });
+      expect(local.value("good")).toEqual(present("remote"));
+      expect(store.load().issues).toMatchObject([{ key: "bad", reason: "invalid" }]);
+      expect(store.load().remote[id("bad")]?.value).toEqual(server.records[id("bad")]!.value);
+      expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  test.each([400, 403, 413, 422, 409])("definitive rejection %s quarantines unchanged values and bounds retry consent", async status => {
+    const server = new MemoryServer();
+    const first = device(server, "first");
+    first.local.set("rejected", "bad");
+    first.transport.beforeMutate = () => { throw Object.assign(new Error("unsafe upstream detail"), { status, code: "operation_reused" }); };
+    await first.engine.sync();
+    const rejectedId = first.transport.requests[0]!.operationId;
+    expect(first.store.state.pending).toBeUndefined();
+    expect(first.store.state.issues[0]).toMatchObject({ key: "rejected", reason: "conflict" });
+    first.local.set("unrelated", "good");
+    await first.engine.sync();
+    expect(server.value("unrelated")).toEqual(present("good"));
+    expect(first.transport.requests).toHaveLength(2);
+    await first.engine.sync();
+    expect(first.transport.requests).toHaveLength(2);
+    await first.engine.decide(id("rejected"), "local", first.store.load().issues[0]!);
+    await first.engine.sync();
+    expect(server.value("rejected")).toEqual(present("bad"));
+    expect(first.transport.requests.at(-1)!.operationId).not.toBe(rejectedId);
+    expect(first.store.state.rejected?.[id("rejected")]).toBeUndefined();
+  });
+
+  test.each([401, 408, 425, 429, 500, 503])("uncertain HTTP %s retains the exact pending operation", async status => {
+    const server = new MemoryServer();
+    const first = device(server, "first");
+    first.local.set("theme", "first");
+    first.transport.beforeMutate = () => { throw Object.assign(new Error("uncertain"), { status }); };
+    await expect(first.engine.sync()).rejects.toThrow("uncertain");
+    const pending = clone(first.store.state.pending!);
+    first.local.set("theme", "newer");
+    await first.engine.sync();
+    expect(first.transport.requests[1]).toEqual(pending);
+    expect(first.transport.requests[2]!.operationId).not.toBe(pending.operationId);
+    expect(server.value("theme")).toEqual(present("newer"));
+  });
+
+  test("a malformed acknowledgment keeps the committed operation for deduplicated retry", async () => {
+    const server = new MemoryServer();
+    const first = device(server, "first");
+    first.local.set("theme", "committed");
+    const mutate = first.transport.mutate.bind(first.transport);
+    let malformed = true;
+    first.transport.mutate = async request => {
+      const result = await mutate(request);
+      if (malformed) { malformed = false; return { ...result, records: [] }; }
+      return result;
+    };
+    await expect(first.engine.sync()).rejects.toThrow("acknowledgment");
+    const pending = clone(first.store.state.pending!);
+    await first.engine.sync();
+    expect(first.transport.requests[1]).toEqual(pending);
+    expect(server.operations.size).toBe(1);
+    expect(first.store.state.pending).toBeUndefined();
+  });
+
+  test("a local edit while approval is displayed invalidates consent before a decision is stored", async () => {
+    const server = new MemoryServer();
+    server.put("command", present("remote"));
+    const first = device(server, "first");
+    first.local.modes[id("command")] = "approval";
+    await first.engine.sync();
+    const displayed = first.store.load().issues[0]!;
+    first.local.set("command", "unreviewed-local");
+    await expect(first.engine.decide(id("command"), "remote", displayed)).rejects.toThrow("changed");
+    expect(first.store.state.decisions).toEqual({});
+    await first.engine.sync();
+    expect(first.local.value("command")).toEqual(present("unreviewed-local"));
+  });
+
+  test("a real CAS race with identical edits adopts the winner without another write", async () => {
+    const { server, first, second } = await paired();
+    first.local.set("theme", "identical");
+    second.local.set("theme", "identical");
+    second.transport.beforeMutate = () => {
+      const request: MutationRequest = { epoch: server.epoch, operationId: "concurrent", mutations: [
+        { kind: "setting", key: "theme", expectedRevision: server.records[id("theme")]!.revision, value: "identical" },
+      ] };
+      server.mutate("first", request);
+    };
+    const before = second.transport.requests.length;
+    await second.engine.sync();
+    expect(second.transport.requests).toHaveLength(before + 1);
+    expect(server.operations.size).toBe(2);
+    expect(second.store.state.pending).toBeUndefined();
+    expect(second.store.state.issues).toEqual([]);
+    expect(second.store.state.base[id("theme")]).toEqual(present("identical"));
+    expect(second.local.value("theme")).toEqual(present("identical"));
+  });
+
+  test("oversized diagnostics survive a later publish conflict and recovery reconciliation", async () => {
+    const { server, second } = await paired();
+    second.local.set("too-large", "x".repeat(1024 * 1024));
+    second.local.set("theme", "local-race");
+    second.transport.beforeMutate = () => { server.put("theme", present("remote-race")); };
+    await second.engine.sync();
+    expect(second.store.state.issues.map(issue => [issue.key, issue.reason]).sort()).toEqual([
+      ["theme", "conflict"], ["too-large", "invalid"],
+    ]);
+    expect(second.store.state.pending).toBeUndefined();
+    expect(server.value("too-large")).toEqual({ deleted: true });
+  });
+
+  test("an actionable local apply failure does not block an unrelated outgoing record", async () => {
+    const server = new MemoryServer();
+    server.put("blocked", present("incoming"));
+    const first = device(server, "first");
+    first.local.set("outgoing", "publish");
+    first.local.beforeApply = () => { throw new UserError("local file cannot be changed"); };
+    await first.engine.sync();
+    expect(first.local.value("blocked")).toEqual({ deleted: true });
+    expect(first.store.state.issues).toMatchObject([{ key: "blocked", reason: "conflict" }]);
+    expect(server.value("outgoing")).toEqual(present("publish"));
+    expect(first.store.state.base[id("blocked")]).toBeUndefined();
+  });
+  test("pending retry is sent before any refresh or observation of a newer local value", async () => {
+    const server = new MemoryServer();
+    const first = device(server, "first");
+    first.local.set("theme", "pending");
+    first.transport.loseNextReply = true;
+    await expect(first.engine.sync()).rejects.toThrow("response lost");
+    const pending = clone(first.store.state.pending!);
+    first.local.set("theme", "newer");
+    const events: string[] = [];
+    const mutate = first.transport.mutate.bind(first.transport);
+    const changes = first.transport.changes.bind(first.transport);
+    const snapshot = first.transport.snapshot.bind(first.transport);
+    const read = first.local.read.bind(first.local);
+    first.transport.mutate = async request => { events.push(`mutate:${request.operationId}`); return mutate(request); };
+    first.transport.changes = async (epoch, cursor) => { events.push("changes"); return changes(epoch, cursor); };
+    first.transport.snapshot = async () => { events.push("snapshot"); return snapshot(); };
+    first.local.read = async () => { events.push("local"); return read(); };
+    await first.engine.sync();
+    expect(events[0]).toBe(`mutate:${pending.operationId}`);
+    expect(events.indexOf("changes")).toBeGreaterThan(0);
+    expect(events.indexOf("local")).toBeGreaterThan(events.indexOf("changes"));
+    expect(events.at(-1)).toBe(`mutate:${first.transport.requests.at(-1)!.operationId}`);
+    expect(server.value("theme")).toEqual(present("newer"));
+  });
+
+  test("cancellation preserves the pending payload and never quarantines it", async () => {
+    const server = new MemoryServer();
+    const first = device(server, "first");
+    const controller = new AbortController();
+    first.local.set("theme", "pending");
+    first.transport.beforeMutate = () => {
+      controller.abort();
+      throw Object.assign(new Error("aborted response"), { status: 400 });
+    };
+    await expect(first.engine.sync(controller.signal)).rejects.toThrow();
+    const pending = clone(first.store.state.pending!);
+    expect(first.store.state.rejected).toBeUndefined();
+    await first.engine.sync();
+    expect(first.transport.requests[1]).toEqual(pending);
+    expect(server.value("theme")).toEqual(present("pending"));
+  });
+
+  test("changing a rejected local value or resetting its exclusion recovers without pairing", async () => {
+    const server = new MemoryServer();
+    const first = device(server, "first");
+    first.local.set("changed", "rejected");
+    first.transport.beforeMutate = () => { throw Object.assign(new Error("rejected"), { status: 422 }); };
+    await first.engine.sync();
+    first.local.set("changed", "corrected");
+    await first.engine.sync();
+    expect(server.value("changed")).toEqual(present("corrected"));
+    first.local.set("reset", "rejected");
+    first.transport.beforeMutate = () => { throw Object.assign(new Error("rejected"), { status: 422 }); };
+    await first.engine.sync();
+    first.engine.exclude("setting", "reset", true);
+    first.engine.exclude("setting", "reset", false);
+    await first.engine.sync();
+    expect(server.value("reset")).toEqual(present("rejected"));
+    expect(first.store.state.issues).toEqual([]);
   });
 });

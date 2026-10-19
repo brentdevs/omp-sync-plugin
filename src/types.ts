@@ -22,6 +22,7 @@ export interface Connection {
   token: string;
   device: { id: string; name: string; profile: string };
   previousBroker: { url?: Json; token?: Json };
+  enrollmentPending?: true;
 }
 export interface Issue {
   kind: Kind;
@@ -40,6 +41,7 @@ export interface State {
   remote: Record<string, SyncRecord>;
   base: Record<string, Value>;
   pending?: MutationRequest;
+  rejected?: Record<string, { local: Value; code: string }>;
   issues: Issue[];
   decisions: Record<string, Decision>;
   excluded: string[];
