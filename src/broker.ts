@@ -62,7 +62,7 @@ export async function migrateCredentials(connection: Connection, oauth: boolean,
   try {
     signal.throwIfAborted();
     // The host CLI, not this externally loaded extension, lives in Bun's virtual FS.
-    const compiled = Bun.main.includes("$bunfs") || Bun.main.includes("~BUN") || Bun.main.includes("%7EBUN");
+    const compiled = Bun.main.startsWith("/$bunfs/") || /^[a-z]:[\\/]~BUN[\\/]/i.test(Bun.main);
     const command = compiled ? [process.execPath] : [
       process.execPath, fileURLToPath(import.meta.resolve("@oh-my-pi/pi-coding-agent/cli")),
     ];

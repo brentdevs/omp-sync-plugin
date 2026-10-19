@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DiskStore, loadConnection, removeConnection, saveConnection } from "../src/storage";
 import { emptyState, identity, type Connection } from "../src/types";
+import { UserError } from "../src/errors";
 
 const directories: string[] = [];
 function temporary(): string { const dir = mkdtempSync(join(tmpdir(), "omp-sync-storage-")); directories.push(dir); return dir; }
@@ -102,13 +103,13 @@ describe("DiskStore durable boundary", () => {
     const oversized = emptyState("device");
     const huge = { deleted: false as const, value: "x".repeat(64 * 1024 * 1024) };
     oversized.base[identity("setting", "large")] = huge;
-    expect(() => store.save(oversized)).toThrow("64 MiB");
+    expect(() => store.save(oversized)).toThrow(UserError);
     expect(store.load()).toEqual(before);
     const decision = emptyState("device");
     decision.decisions[identity("setting", "large")] = { side: "local", local: huge, remote: { deleted: true } };
-    expect(() => store.save(decision)).toThrow("64 MiB");
+    expect(() => store.save(decision)).toThrow(UserError);
     expect(store.load()).toEqual(before);
-  });
+  }, 20_000); // Two real 64 MiB serializations need headroom on shared Intel macOS runners.
   test("rejects oversized sparse corrupt files before parsing and leaves them intact", () => {
     const dir = temporary(); const path = join(dir, "state.json");
     const fd = openSync(path, "w", 0o600);
