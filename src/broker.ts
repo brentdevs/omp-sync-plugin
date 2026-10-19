@@ -1,4 +1,3 @@
-import { fileURLToPath } from "node:url";
 import type { Settings } from "@oh-my-pi/pi-coding-agent";
 import { cfgAuthBrokerToken, cfgAuthBrokerUrl } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import { equal, type Connection, type Json } from "./types";
@@ -56,6 +55,8 @@ export async function upgradeBrokerToken(settings: Settings, connection: Connect
   }
 }
 
+const MIGRATION_CANCELLED = "Credential migration was cancelled; some credentials may already be on the broker. Local copies were not removed.";
+
 /** Pin the consented destination in the child's environment, never its argv or output. */
 export async function migrateCredentials(connection: Connection, oauth: boolean, environment: boolean, signal: AbortSignal): Promise<boolean> {
   requireDeviceToken(connection.token);
@@ -63,9 +64,7 @@ export async function migrateCredentials(connection: Connection, oauth: boolean,
     signal.throwIfAborted();
     // The host CLI, not this externally loaded extension, lives in Bun's virtual FS.
     const compiled = Bun.main.startsWith("/$bunfs/") || /^[a-z]:[\\/]~BUN[\\/]/i.test(Bun.main);
-    const command = compiled ? [process.execPath] : [
-      process.execPath, fileURLToPath(import.meta.resolve("@oh-my-pi/pi-coding-agent/cli")),
-    ];
+    const command = compiled ? [process.execPath] : [process.execPath, Bun.main];
     command.push("auth-broker", "migrate", "--from-local", "--json");
     if (oauth) command.push("--include-oauth");
     if (environment) command.push("--include-env");
@@ -73,9 +72,12 @@ export async function migrateCredentials(connection: Connection, oauth: boolean,
       env: { ...process.env, OMP_AUTH_BROKER_URL: connection.url, OMP_AUTH_BROKER_TOKEN: connection.token },
       stdout: "ignore", stderr: "ignore", signal, timeout: 120_000,
     });
-    return await child.exited === 0;
-  } catch {
-    if (signal.aborted) throw new UserError("Credential migration was cancelled; local credential copies were not removed");
+    const code = await child.exited;
+    if (signal.aborted) throw new UserError(MIGRATION_CANCELLED);
+    return code === 0;
+  } catch (error) {
+    if (error instanceof UserError) throw error;
+    if (signal.aborted) throw new UserError(MIGRATION_CANCELLED);
     throw new UserError("Could not execute credential migration with this OMP runtime. Run auth-broker migrate --from-local --dry-run directly through your OMP launcher (including nix run) for details. Local credential copies were not removed.");
   }
 }

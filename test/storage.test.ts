@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { closeSync, ftruncateSync, mkdtempSync, openSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -98,18 +99,30 @@ describe("DiskStore durable boundary", () => {
     expect(({} as Record<string, unknown>).polluted).toBeUndefined();
   });
   test("oversized save and decision preserve the previous readable snapshot", () => {
-    const store = new DiskStore(temporary(), "device");
-    const before = emptyState("device"); store.save(before);
-    const oversized = emptyState("device");
-    const huge = { deleted: false as const, value: "x".repeat(64 * 1024 * 1024) };
-    oversized.base[identity("setting", "large")] = huge;
-    expect(() => store.save(oversized)).toThrow(UserError);
+    const dir = temporary(); const path = join(dir, "state.json");
+    const store = new DiskStore(dir, "device");
+    const before = emptyState("device");
+    const id = identity("setting", "large");
+    const base = { deleted: false as const, value: "" };
+    const local = { deleted: false as const, value: "" };
+    before.base[id] = base;
+    before.decisions[id] = { side: "local", local, remote: { deleted: true } };
+    const limit = 64 * 1024 * 1024;
+    const available = limit - Buffer.byteLength(JSON.stringify(before));
+    const baseValue = "x".repeat(Math.floor(available / 2));
+    base.value = baseValue; local.value = "x".repeat(available - baseValue.length);
+    store.save(before);
+    expect(statSync(path).size).toBe(limit);
     expect(store.load()).toEqual(before);
-    const decision = emptyState("device");
-    decision.decisions[identity("setting", "large")] = { side: "local", local: huge, remote: { deleted: true } };
-    expect(() => store.save(decision)).toThrow(UserError);
-    expect(store.load()).toEqual(before);
-  }, 20_000); // Two real 64 MiB serializations need headroom on shared Intel macOS runners.
+    const digest = () => createHash("sha256").update(readFileSync(path)).digest("hex");
+    const original = digest();
+    base.value += "x";
+    expect(() => store.save(before)).toThrow(UserError);
+    expect(digest()).toBe(original);
+    base.value = baseValue; local.value += "x";
+    expect(() => store.save(before)).toThrow(UserError);
+    expect(digest()).toBe(original);
+  }, 20_000); // Real 64 MiB serialization and readback need headroom on shared Intel macOS runners.
   test("rejects oversized sparse corrupt files before parsing and leaves them intact", () => {
     const dir = temporary(); const path = join(dir, "state.json");
     const fd = openSync(path, "w", 0o600);
