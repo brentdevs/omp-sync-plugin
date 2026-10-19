@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, dirname, join } from "node:path";
+import { join } from "node:path";
 import { AuthStorage } from "@oh-my-pi/pi-ai";
 import { startAuthBroker } from "@oh-my-pi/pi-ai/auth-broker/server";
 import { migrateCredentials } from "../src/broker";
@@ -10,7 +10,7 @@ import type { Connection } from "../src/types";
 const consentedToken = `omps_${"A".repeat(43)}`;
 const unrelatedToken = `omps_${"B".repeat(43)}`;
 // Real HTTP/SQLite/subprocess integration: no simulated credential destination or CLI output.
-test("migration uploads only to the consented broker despite changed config and environment", async () => {
+test("migration without omp on PATH uploads only to the consented broker despite changed config and environment", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-sync-migration-"));
   const agentDir = join(root, "agent"); mkdirSync(agentDir);
   const local = await AuthStorage.create(join(agentDir, "agent.db"));
@@ -29,7 +29,7 @@ test("migration uploads only to the consented broker despite changed config and 
     try {
       process.env.HOME = root;
       process.env.PI_CODING_AGENT_DIR = agentDir;
-      process.env.PATH = [join(import.meta.dir, "../node_modules/.bin"), dirname(process.execPath), previous.PATH ?? ""].join(delimiter);
+      process.env.PATH = "";
       process.env.OMP_AUTH_BROKER_URL = second.url;
       process.env.OMP_AUTH_BROKER_TOKEN = unrelatedToken;
       // Spawn captures its environment synchronously; restore the test process before awaiting it.

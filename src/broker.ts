@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import type { Settings } from "@oh-my-pi/pi-coding-agent";
 import { cfgAuthBrokerToken, cfgAuthBrokerUrl } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import { equal, type Connection, type Json } from "./types";
@@ -57,11 +58,24 @@ export async function upgradeBrokerToken(settings: Settings, connection: Connect
 
 /** Pin the consented destination in the child's environment, never its argv or output. */
 export async function migrateCredentials(connection: Connection, oauth: boolean, environment: boolean, signal: AbortSignal): Promise<boolean> {
-  signal.throwIfAborted();
   requireDeviceToken(connection.token);
-  const child = Bun.spawn(["omp", "auth-broker", "migrate", "--from-local", "--json", ...(oauth ? ["--include-oauth"] : []), ...(environment ? ["--include-env"] : [])], {
-    env: { ...process.env, OMP_AUTH_BROKER_URL: connection.url, OMP_AUTH_BROKER_TOKEN: connection.token },
-    stdout: "ignore", stderr: "ignore", signal, timeout: 120_000,
-  });
-  return await child.exited === 0;
+  try {
+    signal.throwIfAborted();
+    // The host CLI, not this externally loaded extension, lives in Bun's virtual FS.
+    const compiled = Bun.main.includes("$bunfs") || Bun.main.includes("~BUN") || Bun.main.includes("%7EBUN");
+    const command = compiled ? [process.execPath] : [
+      process.execPath, fileURLToPath(import.meta.resolve("@oh-my-pi/pi-coding-agent/cli")),
+    ];
+    command.push("auth-broker", "migrate", "--from-local", "--json");
+    if (oauth) command.push("--include-oauth");
+    if (environment) command.push("--include-env");
+    const child = Bun.spawn(command, {
+      env: { ...process.env, OMP_AUTH_BROKER_URL: connection.url, OMP_AUTH_BROKER_TOKEN: connection.token },
+      stdout: "ignore", stderr: "ignore", signal, timeout: 120_000,
+    });
+    return await child.exited === 0;
+  } catch {
+    if (signal.aborted) throw new UserError("Credential migration was cancelled; local credential copies were not removed");
+    throw new UserError("Could not execute credential migration with this OMP runtime. Run auth-broker migrate --from-local --dry-run directly through your OMP launcher (including nix run) for details. Local credential copies were not removed.");
+  }
 }
