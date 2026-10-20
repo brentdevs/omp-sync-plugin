@@ -124,7 +124,10 @@ export class Controller {
           signal.throwIfAborted();
           this.failures = 0; this.lastError = undefined;
           const brokerWarning = brokerMatches(this.settings, connection) ? "" : " · broker config differs";
-          this.ctx.ui.setStatus("omp-sync", state ? `Sync: ${state.issues.length ? `${state.issues.length} need review` : "connected"}${brokerWarning}` : "Sync: another OMP instance is syncing");
+          this.ctx.ui.setStatus("omp-sync",
+            state && !state.issues.length && !brokerWarning ? undefined
+              : state ? `Sync: ${state.issues.length ? `${state.issues.length} need review` : "connected"}${brokerWarning}`
+                : "Sync: another OMP instance is syncing");
           return state;
         }, false);
         return result;

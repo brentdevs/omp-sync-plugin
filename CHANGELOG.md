@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.2
+
+- Hide the healthy connected footer status while preserving actionable warnings and `/sync status` details.
+
 ## 0.1.1
 
 - Credential migration reuses the active OMP/Bun runtime instead of requiring `omp` on `PATH`, including compiled binaries started with `nix run`.

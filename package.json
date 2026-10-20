@@ -1,6 +1,6 @@
 {
   "name": "omp-sync-plugin",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Automatic settings and provider sync for oh-my-pi with a self-hosted auth broker",
   "type": "module",
   "license": "MIT",
