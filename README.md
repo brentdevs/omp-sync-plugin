@@ -32,6 +32,8 @@ Pairing codes expire after ten minutes. Do not put device tokens in slash comman
 
 An unpaired installation does not contact a server and checks local enrollment every thirty seconds. Once paired, the main OMP session checks changes every two seconds; subagents do not start independent loops. Sync stops on exit and catches up next launch, including local edits made while closed. All updated OMP processes sharing an agent directory use one crash-released SQLite enrollment lease for sync, review mutations, connect/disconnect, and migration, always before their per-device lease. Disconnect waits for in-flight work; an old enrollment cannot keep applying or publishing after that barrier.
 
+The footer is quiet while paired sync is healthy: there is no persistent `Sync: connected` badge. Review items, connection errors, revocation, pairing prompts and broker-routing warnings remain visible; the footer clears again after successful synchronization resolves them. Use `/sync status` for connection details at any time. This changes display only, not the polling interval or synchronization behavior.
+
 ## What synchronizes
 
 - **Explicit global settings** from OMP's `config.yml`/`config.yaml`, keyed by registered setting ID. Defaults, project settings, additional config overlays, runtime flags and environment values are never exported as global preferences.
